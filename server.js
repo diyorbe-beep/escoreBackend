@@ -10,6 +10,8 @@ const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
+const FormData = require('form-data');
 
 const SUPABASE_URL = 'https://rizfpyurlqwuydltxflk.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJpemZweXVybHF3dXlkbHR4ZmxrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTM0MTk1ODQsImV4cCI6MjA2ODk5NTU4NH0.KfJ56Zc1PRvZx0-DuPmvzFC7fLQOIgAAZPjqnNscqc0';
@@ -65,173 +67,231 @@ const ADMIN = {
   role: 'admin'
 };
 
-// Helper: read/write JSON
-function readData(file) {
-  const filePath = path.join(dataDir, file);
+// Helper functions for JSON file CRUD
+function readJson(file) {
+  const filePath = path.join(__dirname, 'data', file);
   if (!fs.existsSync(filePath)) return [];
   return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
 }
-function writeData(file, data) {
-  const filePath = path.join(dataDir, file);
+function writeJson(file, data) {
+  const filePath = path.join(__dirname, 'data', file);
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
-// --- Superadmin va adminni har doim mavjud qilish ---
-async function ensureSuperadminAndAdminSupabase() {
-  // Check users in Supabase
-  const { data: users, error } = await supabase.from('users').select('*');
-  if (error) throw new Error('Supabase users fetch error: ' + error.message);
-  let superadminExists = users.some(u => u.email === SUPERADMIN.email);
-  let adminExists = users.some(u => u.email === ADMIN.email);
-  if (!superadminExists) {
-    await supabase.from('users').insert([{ ...SUPERADMIN }]);
-  }
-  if (!adminExists) {
-    await supabase.from('users').insert([{ ...ADMIN }]);
-  }
-}
-
-ensureSuperadminAndAdminSupabase();
-
-// --- MongoDB va Mongoose bilan bog'liq kodlar olib tashlandi ---
-// --- News endpoints (Supabase) ---
-app.get('/api/news', async (req, res) => {
-  const { data, error } = await supabase
-    .from('news')
-    .select('*')
-    .eq('deleted', false)
-    .order('published_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+// --- NEWS ---
+app.get('/api/news', (req, res) => {
+  const news = readJson('news.json').filter(n => !n.deleted);
+  res.json(news);
 });
-
-app.post('/api/news', async (req, res) => {
-  const { title, content, image, status, isFeatured, category } = req.body;
+app.get('/api/news/:id', (req, res) => {
+  const news = readJson('news.json');
+  const item = news.find(n => n.id === req.params.id);
+  if (!item) return res.status(404).json({ error: 'Yangilik topilmadi' });
+  res.json(item);
+});
+app.post('/api/news', (req, res) => {
+  const { title, content, image, status, category, isFeatured } = req.body;
   if (!title || !content) return res.status(400).json({ error: 'Title va content majburiy' });
-  // isFeatured bo'lsa, avval hammasini false qilamiz
-  if (isFeatured) {
-    await supabase.from('news').update({ is_featured: false }).neq('id', null);
-  }
-  const { data, error } = await supabase.from('news').insert([{
+  let news = readJson('news.json');
+  const newItem = {
     id: uuidv4(),
     title,
     content,
-    image: image || null,
+    image: image || '',
     status: status || 'Draft',
-    is_featured: !!isFeatured,
     category: category || '',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     deleted: false,
-    published_at: new Date().toISOString(),
-  }]);
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data[0]);
+    isFeatured: !!isFeatured
+  };
+  news.push(newItem);
+  writeJson('news.json', news);
+  res.status(201).json(newItem);
 });
-
-app.put('/api/news/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { title, content, image, status, isFeatured, category } = req.body;
-    if (isFeatured) {
-      await supabase.from('news').update({ is_featured: false }).neq('id', id);
-    }
-    const { data, error } = await supabase.from('news').update({
-      title,
-      content,
-      image,
-      status,
-      is_featured: !!isFeatured,
-      category: category || '',
-    }).eq('id', id);
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ success: true, news: data && data[0] });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.delete('/api/news/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { error } = await supabase.from('news').update({ deleted: true }).eq('id', id);
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// --- News Comments API ---
-app.get('/api/news/:id/comments', async (req, res) => {
+app.put('/api/news/:id', (req, res) => {
   const { id } = req.params;
-  const { data: comments, error } = await supabase.from('comments').select('*').eq('newsId', id);
-  if (error) return res.status(500).json({ error: error.message });
+  let news = readJson('news.json');
+  const idx = news.findIndex(n => n.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Yangilik topilmadi' });
+  news[idx] = { ...news[idx], ...req.body, updatedAt: new Date().toISOString() };
+  writeJson('news.json', news);
+  res.json(news[idx]);
+});
+app.delete('/api/news/:id', (req, res) => {
+  const { id } = req.params;
+  let news = readJson('news.json');
+  const idx = news.findIndex(n => n.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Yangilik topilmadi' });
+  news[idx].deleted = true;
+  writeJson('news.json', news);
+  res.json({ success: true });
+});
+
+// --- MATCHES ---
+app.get('/api/matches', (req, res) => {
+  const matches = readJson('matches.json');
+  res.json(matches);
+});
+app.get('/api/matches/:id', (req, res) => {
+  const matches = readJson('matches.json');
+  const item = matches.find(m => m.id === req.params.id);
+  if (!item) return res.status(404).json({ error: 'Match topilmadi' });
+  res.json(item);
+});
+app.post('/api/matches', (req, res) => {
+  const { home, away, time, date, league } = req.body;
+  if (!home || !away || !time || !date || !league) return res.status(400).json({ error: 'Barcha maydonlar majburiy' });
+  let matches = readJson('matches.json');
+  const newItem = {
+    id: uuidv4(),
+    home,
+    away,
+    time,
+    date,
+    league,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  matches.push(newItem);
+  writeJson('matches.json', matches);
+  res.status(201).json(newItem);
+});
+app.put('/api/matches/:id', (req, res) => {
+  const { id } = req.params;
+  let matches = readJson('matches.json');
+  const idx = matches.findIndex(m => m.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Match topilmadi' });
+  matches[idx] = { ...matches[idx], ...req.body, updatedAt: new Date().toISOString() };
+  writeJson('matches.json', matches);
+  res.json(matches[idx]);
+});
+app.delete('/api/matches/:id', (req, res) => {
+  const { id } = req.params;
+  let matches = readJson('matches.json');
+  const idx = matches.findIndex(m => m.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Match topilmadi' });
+  matches.splice(idx, 1);
+  writeJson('matches.json', matches);
+  res.json({ success: true });
+});
+
+// --- POLLS ---
+app.get('/api/polls', (req, res) => {
+  const polls = readJson('polls.json');
+  res.json(polls);
+});
+app.get('/api/polls/:id', (req, res) => {
+  const polls = readJson('polls.json');
+  const item = polls.find(p => p.id === req.params.id);
+  if (!item) return res.status(404).json({ error: 'Poll topilmadi' });
+  res.json(item);
+});
+app.post('/api/polls', (req, res) => {
+  const { question, options } = req.body;
+  if (!question || !Array.isArray(options) || options.length < 2) {
+    return res.status(400).json({ error: 'Savol va kamida 2 ta variant majburiy' });
+  }
+  let polls = readJson('polls.json');
+  const votes = {};
+  options.forEach(opt => { votes[opt] = 0; });
+  const newItem = {
+    id: uuidv4(),
+    question,
+    options,
+    votes,
+    createdAt: new Date().toISOString()
+  };
+  polls.push(newItem);
+  writeJson('polls.json', polls);
+  res.status(201).json(newItem);
+});
+app.put('/api/polls/:id', (req, res) => {
+  const { id } = req.params;
+  let polls = readJson('polls.json');
+  const idx = polls.findIndex(p => p.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Poll topilmadi' });
+  polls[idx] = { ...polls[idx], ...req.body };
+  writeJson('polls.json', polls);
+  res.json(polls[idx]);
+});
+app.delete('/api/polls/:id', (req, res) => {
+  const { id } = req.params;
+  let polls = readJson('polls.json');
+  const idx = polls.findIndex(p => p.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Poll topilmadi' });
+  polls.splice(idx, 1);
+  writeJson('polls.json', polls);
+  res.json({ success: true });
+});
+app.post('/api/polls/vote', (req, res) => {
+  const { pollId, option } = req.body;
+  let polls = readJson('polls.json');
+  const idx = polls.findIndex(p => p.id === pollId);
+  if (idx === -1) return res.status(404).json({ error: 'Poll topilmadi' });
+  if (!polls[idx].votes[option]) polls[idx].votes[option] = 0;
+  polls[idx].votes[option] += 1;
+  writeJson('polls.json', polls);
+  res.json({ success: true });
+});
+
+// --- CATEGORIES ---
+app.get('/api/categories', (req, res) => {
+  const categories = readJson('categories.json');
+  res.json(categories);
+});
+app.post('/api/categories', (req, res) => {
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: 'Kategoriya nomi majburiy' });
+  let categories = readJson('categories.json');
+  const newItem = { id: uuidv4(), name };
+  categories.push(newItem);
+  writeJson('categories.json', categories);
+  res.status(201).json(newItem);
+});
+app.delete('/api/categories/:id', (req, res) => {
+  const { id } = req.params;
+  let categories = readJson('categories.json');
+  const idx = categories.findIndex(c => c.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Kategoriya topilmadi' });
+  categories.splice(idx, 1);
+  writeJson('categories.json', categories);
+  res.json({ success: true });
+});
+
+// --- COMMENTS ---
+app.get('/api/comments', (req, res) => {
+  const comments = readJson('comments.json');
   res.json(comments);
 });
-
-app.post('/api/news/:id/comments', async (req, res) => {
+app.get('/api/news/:id/comments', (req, res) => {
+  const { id } = req.params;
+  const comments = readJson('comments.json').filter(c => c.newsId === id);
+  res.json(comments);
+});
+app.post('/api/news/:id/comments', (req, res) => {
   const { id } = req.params;
   const { author, text } = req.body;
   if (!author || !text) return res.status(400).json({ error: 'Ism va izoh majburiy' });
-  const newComment = {
+  let comments = readJson('comments.json');
+  const newItem = {
     id: uuidv4(),
     newsId: id,
     author,
     text,
     createdAt: new Date().toISOString()
   };
-  const { error } = await supabase.from('comments').insert([newComment]);
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(newComment);
+  comments.push(newItem);
+  writeJson('comments.json', comments);
+  res.status(201).json(newItem);
 });
-
-app.delete('/api/news/:id/comments/:commentId', async (req, res) => {
-  const { id, commentId } = req.params;
-  // Check if comment exists
-  const { data: comments, error: fetchError } = await supabase.from('comments').select('*').eq('id', commentId).eq('newsId', id);
-  if (fetchError) return res.status(500).json({ error: fetchError.message });
-  if (!comments || comments.length === 0) return res.status(404).json({ error: 'Izoh topilmadi' });
-  const { error } = await supabase.from('comments').delete().eq('id', commentId).eq('newsId', id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
-});
-
-// --- Admin endpoints (faqat superadmin qo'sha oladi) ---
-app.get('/api/admins', async (req, res) => {
-  const { data: admins, error } = await supabase.from('admins').select('*');
-  if (error) return res.status(500).json({ error: error.message });
-  // Superadmin har doim birinchi bo'lib qaytadi
-  if (!admins.find(a => a.email === SUPERADMIN.email)) {
-    admins.unshift({ id: SUPERADMIN.id, name: SUPERADMIN.name, email: SUPERADMIN.email, role: SUPERADMIN.role });
-  }
-  res.json(admins);
-});
-
-app.post('/api/admins', async (req, res) => {
-  const { name, email, role = 'admin', superadminToken } = req.body;
-  if (!name || !email) return res.status(400).json({ error: 'Ism va email majburiy' });
-  if (email === SUPERADMIN.email) return res.status(400).json({ error: 'Superadminni qo\'shib bo\'lmaydi' });
-  if (role !== 'admin' && role !== 'journalist') return res.status(400).json({ error: 'Faqat admin yoki jurnalist qo\'shish mumkin' });
-  if (superadminToken !== SUPERADMIN.password) return res.status(403).json({ error: 'Faqat superadmin admin yoki jurnalist qo\'sha oladi' });
-  // Check if admin exists in Supabase
-  const { data: admins, error: fetchError } = await supabase.from('admins').select('*').eq('email', email);
-  if (fetchError) return res.status(500).json({ error: fetchError.message });
-  if (admins.length > 0) return res.status(400).json({ error: 'Bu email admin sifatida mavjud' });
-  const newAdmin = { id: uuidv4(), name, email, role };
-  const { error: insertError } = await supabase.from('admins').insert([newAdmin]);
-  if (insertError) return res.status(500).json({ error: insertError.message });
-  // users jadvaliga ham qo'shamiz
-  const { error: userInsertError } = await supabase.from('users').insert([{ id: newAdmin.id, name, email, password: 'admin123', role }]);
-  if (userInsertError) return res.status(500).json({ error: userInsertError.message });
-  res.status(201).json(newAdmin);
-});
-
-app.delete('/api/admins/:id', async (req, res) => {
+app.delete('/api/comments/:id', (req, res) => {
   const { id } = req.params;
-  // Superadminni o'chirishga yo'l qo'ymaymiz
-  if (id === SUPERADMIN.id) return res.status(400).json({ error: 'Superadminni o\'chirish mumkin emas' });
-  // Delete from admins
-  const { error } = await supabase.from('admins').delete().eq('id', id);
-  if (error) return res.status(500).json({ error: error.message });
+  let comments = readJson('comments.json');
+  const idx = comments.findIndex(c => c.id === id);
+  if (idx === -1) return res.status(404).json({ error: 'Izoh topilmadi' });
+  comments.splice(idx, 1);
+  writeJson('comments.json', comments);
   res.json({ success: true });
 });
 
@@ -248,74 +308,21 @@ app.post('/api/auth/register', async (req, res) => {
   res.status(201).json({ message: "Ro'yxatdan o'tildi", user: data[0] });
 });
 
-app.post('/api/auth/login', async (req, res) => {
+// Foydalanuvchini JSON file orqali login qilish
+app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
-  const { data: users, error } = await supabase.from('users').select('*').eq('email', email).eq('password', password);
-  if (error) return res.status(500).json({ error: error.message });
-  if (!users || users.length === 0) return res.status(401).json({ error: 'Email yoki parol xato' });
-  // Demo token
-  const token = uuidv4();
-  res.json({ token, user: users[0] });
-});
-
-// --- Matches (Supabase) ---
-app.get('/api/matches', async (req, res) => {
-  const { data: matches, error } = await supabase.from('matches').select('*');
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(matches);
-});
-
-// --- Polls (Supabase) ---
-app.get('/api/polls', async (req, res) => {
-  const { data: polls, error } = await supabase.from('polls').select('*');
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(polls);
-});
-
-// Yangi poll qo'shish (faqat admin/superadmin)
-app.post('/api/polls', async (req, res) => {
-  const { question, options, role } = req.body;
-  if (!question || !Array.isArray(options) || options.length < 2) {
-    return res.status(400).json({ error: 'Savol va kamida 2 ta variant majburiy' });
+  const fs = require('fs');
+  const usersPath = path.join(__dirname, 'data', 'users.json');
+  if (!fs.existsSync(usersPath)) {
+    return res.status(500).json({ error: 'Foydalanuvchilar fayli topilmadi' });
   }
-  if (role !== 'admin' && role !== 'superadmin') {
-    return res.status(403).json({ error: "Faqat admin yoki superadmin so'rovnoma qo'sha oladi" });
+  const users = JSON.parse(fs.readFileSync(usersPath, 'utf-8'));
+  const user = users.find(u => u.email === email && u.password === password);
+  if (!user) {
+    return res.status(401).json({ error: 'Email yoki parol xato' });
   }
-  const votes = {};
-  options.forEach(opt => { votes[opt] = 0; });
-  const newPoll = {
-    id: uuidv4(),
-    question,
-    options,
-    votes,
-    createdAt: new Date().toISOString()
-  };
-  const { error } = await supabase.from('polls').insert([newPoll]);
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(newPoll);
-});
-
-app.post('/api/polls/vote', async (req, res) => {
-  const { pollId, option } = req.body;
-  const { data: polls, error: fetchError } = await supabase.from('polls').select('*').eq('id', pollId);
-  if (fetchError) return res.status(500).json({ error: fetchError.message });
-  if (!polls || polls.length === 0) return res.status(404).json({ error: 'Poll topilmadi' });
-  const poll = polls[0];
-  poll.votes[option] = (poll.votes[option] || 0) + 1;
-  const { error } = await supabase.from('polls').update({ votes: poll.votes }).eq('id', pollId);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
-});
-
-app.delete('/api/polls/:id', async (req, res) => {
-  const { id } = req.params;
-  const { role, superadminToken } = req.query;
-  if (role !== 'admin' && role !== 'superadmin' && superadminToken !== SUPERADMIN.password) {
-    return res.status(403).json({ error: "Faqat admin yoki superadmin so'rovnomani o'chira oladi" });
-  }
-  const { error } = await supabase.from('polls').delete().eq('id', id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true });
+  const token = 'demo-token';
+  res.json({ token, user });
 });
 
 // --- User profile (oddiy demo) ---
@@ -360,10 +367,29 @@ app.delete('/api/categories/:id', async (req, res) => {
 // Static uploads
 // app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Rasm yuklash endpointi (Cloudinary)
-app.post('/api/upload', upload.single('image'), (req, res) => {
-  if (!req.file || !req.file.path) return res.status(400).json({ error: 'Fayl topilmadi' });
-  res.json({ url: req.file.path });
+// Uploadcare orqali fayl yuklash
+app.post('/api/upload', upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Fayl topilmadi' });
+  }
+  const fs = require('fs');
+  const form = new FormData();
+  form.append('UPLOADCARE_PUB_KEY', UPLOADCARE_PUBLIC_KEY);
+  form.append('UPLOADCARE_STORE', '1');
+  form.append('file', fs.createReadStream(req.file.path));
+  try {
+    const response = await axios.post(
+      'https://upload.uploadcare.com/base/',
+      form,
+      { headers: form.getHeaders() }
+    );
+    fs.unlinkSync(req.file.path); // vaqtincha faylni o'chirish
+    const fileId = response.data.file;
+    const fileUrl = `https://ucarecdn.com/${fileId}/`;
+    res.json({ url: fileUrl });
+  } catch (error) {
+    res.status(500).json({ error: 'Uploadcare xatosi: ' + error.message });
+  }
 });
 
 const teamLogos = {

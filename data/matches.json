@@ -1,1 +1,12 @@
-[]
+[
+  {
+    "id": "1",
+    "home": { "name": "Real Madrid", "logo": "https://ucarecdn.com/demoimage/" },
+    "away": { "name": "Barcelona", "logo": "https://ucarecdn.com/demoimage/" },
+    "time": "20:00",
+    "date": "2024-07-25",
+    "league": "La Liga",
+    "createdAt": "2024-07-25T12:00:00Z",
+    "updatedAt": "2024-07-25T12:00:00Z"
+  }
+]

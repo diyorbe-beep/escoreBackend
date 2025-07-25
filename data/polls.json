@@ -1,0 +1,9 @@
+[
+  {
+    "id": "1",
+    "question": "Qaysi jamoa g'alaba qozonadi?",
+    "options": ["Real Madrid", "Barcelona"],
+    "votes": { "Real Madrid": 10, "Barcelona": 7 },
+    "createdAt": "2024-07-25T12:00:00Z"
+  }
+] 
