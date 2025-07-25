@@ -8,7 +8,6 @@ const multer = require('multer');
 // Cloudinary
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
-const mongoose = require('mongoose');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
@@ -78,46 +77,23 @@ function writeData(file, data) {
 }
 
 // --- Superadmin va adminni har doim mavjud qilish ---
-function ensureSuperadminAndAdmin() {
-  // users.json
-  let users = readData('users.json');
-  let changed = false;
-  if (!users.find(u => u.email === SUPERADMIN.email)) {
-    users.unshift({ ...SUPERADMIN });
-    changed = true;
+async function ensureSuperadminAndAdminSupabase() {
+  // Check users in Supabase
+  const { data: users, error } = await supabase.from('users').select('*');
+  if (error) throw new Error('Supabase users fetch error: ' + error.message);
+  let superadminExists = users.some(u => u.email === SUPERADMIN.email);
+  let adminExists = users.some(u => u.email === ADMIN.email);
+  if (!superadminExists) {
+    await supabase.from('users').insert([{ ...SUPERADMIN }]);
   }
-  if (!users.find(u => u.email === ADMIN.email)) {
-    users.unshift({ ...ADMIN });
-    changed = true;
+  if (!adminExists) {
+    await supabase.from('users').insert([{ ...ADMIN }]);
   }
-  if (changed) writeData('users.json', users);
-  // admins.json
-  let admins = readData('admins.json');
-  let adminsChanged = false;
-  if (!admins.find(a => a.email === SUPERADMIN.email)) {
-    admins.unshift({ id: SUPERADMIN.id, name: SUPERADMIN.name, email: SUPERADMIN.email, role: SUPERADMIN.role });
-    adminsChanged = true;
-  }
-  if (!admins.find(a => a.email === ADMIN.email)) {
-    admins.push({ id: ADMIN.id, name: ADMIN.name, email: ADMIN.email, role: ADMIN.role });
-    adminsChanged = true;
-  }
-  if (adminsChanged) writeData('admins.json', admins);
 }
-ensureSuperadminAndAdmin();
 
-const newsSchema = new mongoose.Schema({
-  title: String,
-  content: String,
-  image: String,
-  status: { type: String, default: 'Draft' },
-  deleted: { type: Boolean, default: false },
-  publishedAt: { type: Date, default: Date.now },
-  isFeatured: { type: Boolean, default: false },
-  category: String,
-});
-const News = mongoose.model('News', newsSchema);
+ensureSuperadminAndAdminSupabase();
 
+// --- MongoDB va Mongoose bilan bog'liq kodlar olib tashlandi ---
 // --- News endpoints (Supabase) ---
 app.get('/api/news', async (req, res) => {
   const { data, error } = await supabase
@@ -137,6 +113,7 @@ app.post('/api/news', async (req, res) => {
     await supabase.from('news').update({ is_featured: false }).neq('id', null);
   }
   const { data, error } = await supabase.from('news').insert([{
+    id: uuidv4(),
     title,
     content,
     image: image || null,
@@ -155,17 +132,18 @@ app.put('/api/news/:id', async (req, res) => {
     const { id } = req.params;
     const { title, content, image, status, isFeatured, category } = req.body;
     if (isFeatured) {
-      await News.updateMany({}, { isFeatured: false });
+      await supabase.from('news').update({ is_featured: false }).neq('id', id);
     }
-    const updated = await News.findByIdAndUpdate(id, {
+    const { data, error } = await supabase.from('news').update({
       title,
       content,
       image,
       status,
-      isFeatured: !!isFeatured,
+      is_featured: !!isFeatured,
       category: category || '',
-    }, { new: true });
-    res.json({ success: true, news: updated });
+    }).eq('id', id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, news: data && data[0] });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -174,7 +152,8 @@ app.put('/api/news/:id', async (req, res) => {
 app.delete('/api/news/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await News.findByIdAndUpdate(id, { deleted: true });
+    const { error } = await supabase.from('news').update({ deleted: true }).eq('id', id);
+    if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -182,18 +161,17 @@ app.delete('/api/news/:id', async (req, res) => {
 });
 
 // --- News Comments API ---
-app.get('/api/news/:id/comments', (req, res) => {
+app.get('/api/news/:id/comments', async (req, res) => {
   const { id } = req.params;
-  const comments = readData('comments.json');
-  const newsComments = comments.filter(c => c.newsId === id);
-  res.json(newsComments);
+  const { data: comments, error } = await supabase.from('comments').select('*').eq('newsId', id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(comments);
 });
 
-app.post('/api/news/:id/comments', (req, res) => {
+app.post('/api/news/:id/comments', async (req, res) => {
   const { id } = req.params;
   const { author, text } = req.body;
   if (!author || !text) return res.status(400).json({ error: 'Ism va izoh majburiy' });
-  const comments = readData('comments.json');
   const newComment = {
     id: uuidv4(),
     newsId: id,
@@ -201,24 +179,26 @@ app.post('/api/news/:id/comments', (req, res) => {
     text,
     createdAt: new Date().toISOString()
   };
-  comments.push(newComment);
-  writeData('comments.json', comments);
+  const { error } = await supabase.from('comments').insert([newComment]);
+  if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(newComment);
 });
 
-app.delete('/api/news/:id/comments/:commentId', (req, res) => {
+app.delete('/api/news/:id/comments/:commentId', async (req, res) => {
   const { id, commentId } = req.params;
-  let comments = readData('comments.json');
-  const exists = comments.find(c => c.id === commentId && c.newsId === id);
-  if (!exists) return res.status(404).json({ error: 'Izoh topilmadi' });
-  comments = comments.filter(c => !(c.id === commentId && c.newsId === id));
-  writeData('comments.json', comments);
+  // Check if comment exists
+  const { data: comments, error: fetchError } = await supabase.from('comments').select('*').eq('id', commentId).eq('newsId', id);
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (!comments || comments.length === 0) return res.status(404).json({ error: 'Izoh topilmadi' });
+  const { error } = await supabase.from('comments').delete().eq('id', commentId).eq('newsId', id);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
 // --- Admin endpoints (faqat superadmin qo'sha oladi) ---
-app.get('/api/admins', (req, res) => {
-  let admins = readData('admins.json');
+app.get('/api/admins', async (req, res) => {
+  const { data: admins, error } = await supabase.from('admins').select('*');
+  if (error) return res.status(500).json({ error: error.message });
   // Superadmin har doim birinchi bo'lib qaytadi
   if (!admins.find(a => a.email === SUPERADMIN.email)) {
     admins.unshift({ id: SUPERADMIN.id, name: SUPERADMIN.name, email: SUPERADMIN.email, role: SUPERADMIN.role });
@@ -226,74 +206,74 @@ app.get('/api/admins', (req, res) => {
   res.json(admins);
 });
 
-app.post('/api/admins', (req, res) => {
+app.post('/api/admins', async (req, res) => {
   const { name, email, role = 'admin', superadminToken } = req.body;
   if (!name || !email) return res.status(400).json({ error: 'Ism va email majburiy' });
   if (email === SUPERADMIN.email) return res.status(400).json({ error: 'Superadminni qo\'shib bo\'lmaydi' });
-  // Faqat superadmin tokeni bilan admin yoki jurnalist qo'shish mumkin
   if (role !== 'admin' && role !== 'journalist') return res.status(400).json({ error: 'Faqat admin yoki jurnalist qo\'shish mumkin' });
   if (superadminToken !== SUPERADMIN.password) return res.status(403).json({ error: 'Faqat superadmin admin yoki jurnalist qo\'sha oladi' });
-  const admins = readData('admins.json');
-  if (admins.find(a => a.email === email)) return res.status(400).json({ error: 'Bu email admin sifatida mavjud' });
+  // Check if admin exists in Supabase
+  const { data: admins, error: fetchError } = await supabase.from('admins').select('*').eq('email', email);
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (admins.length > 0) return res.status(400).json({ error: 'Bu email admin sifatida mavjud' });
   const newAdmin = { id: uuidv4(), name, email, role };
-  admins.push(newAdmin);
-  writeData('admins.json', admins);
-  // users.json ga ham qo'shamiz
-  let users = readData('users.json');
-  users.push({ id: newAdmin.id, name, email, password: 'admin123', role });
-  writeData('users.json', users);
+  const { error: insertError } = await supabase.from('admins').insert([newAdmin]);
+  if (insertError) return res.status(500).json({ error: insertError.message });
+  // users jadvaliga ham qo'shamiz
+  const { error: userInsertError } = await supabase.from('users').insert([{ id: newAdmin.id, name, email, password: 'admin123', role }]);
+  if (userInsertError) return res.status(500).json({ error: userInsertError.message });
   res.status(201).json(newAdmin);
 });
 
-app.delete('/api/admins/:id', (req, res) => {
-  let admins = readData('admins.json');
+app.delete('/api/admins/:id', async (req, res) => {
+  const { id } = req.params;
   // Superadminni o'chirishga yo'l qo'ymaymiz
-  admins = admins.filter(a => a.id !== req.params.id && a.email !== SUPERADMIN.email);
-  // Lekin superadmin har doim bo'lishi kerak
-  if (!admins.find(a => a.email === SUPERADMIN.email)) {
-    admins.unshift({ id: SUPERADMIN.id, name: SUPERADMIN.name, email: SUPERADMIN.email, role: SUPERADMIN.role });
-  }
-  writeData('admins.json', admins);
+  if (id === SUPERADMIN.id) return res.status(400).json({ error: 'Superadminni o\'chirish mumkin emas' });
+  // Delete from admins
+  const { error } = await supabase.from('admins').delete().eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
 // --- User Auth (faqat user roli register bo'ladi) ---
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'Barcha maydonlar majburiy' });
   if (email === SUPERADMIN.email || email === ADMIN.email) return res.status(400).json({ error: 'Bu email band' });
-  const users = readData('users.json');
-  if (users.find(u => u.email === email)) return res.status(400).json({ error: 'Email band' });
-  const newUser = { id: uuidv4(), name, email, password, role: 'user' };
-  users.push(newUser);
-  writeData('users.json', users);
-  res.status(201).json({ message: 'Ro\'yxatdan o\'tildi', user: newUser });
+  const { data: users, error: fetchError } = await supabase.from('users').select('*').eq('email', email);
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (users.length > 0) return res.status(400).json({ error: 'Email band' });
+  const { data, error } = await supabase.from('users').insert([{ id: uuidv4(), name, email, password, role: 'user' }]);
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json({ message: "Ro'yxatdan o'tildi", user: data[0] });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
-  const users = readData('users.json');
-  const user = users.find(u => u.email === email && u.password === password);
-  if (!user) return res.status(401).json({ error: 'Email yoki parol xato' });
+  const { data: users, error } = await supabase.from('users').select('*').eq('email', email).eq('password', password);
+  if (error) return res.status(500).json({ error: error.message });
+  if (!users || users.length === 0) return res.status(401).json({ error: 'Email yoki parol xato' });
   // Demo token
   const token = uuidv4();
-  res.json({ token, user });
+  res.json({ token, user: users[0] });
 });
 
-// --- Matches (oddiy demo) ---
-app.get('/api/matches', (req, res) => {
-  const matches = readData('matches.json');
+// --- Matches (Supabase) ---
+app.get('/api/matches', async (req, res) => {
+  const { data: matches, error } = await supabase.from('matches').select('*');
+  if (error) return res.status(500).json({ error: error.message });
   res.json(matches);
 });
 
-// --- Polls (oddiy demo) ---
-app.get('/api/polls', (req, res) => {
-  const polls = readData('polls.json');
+// --- Polls (Supabase) ---
+app.get('/api/polls', async (req, res) => {
+  const { data: polls, error } = await supabase.from('polls').select('*');
+  if (error) return res.status(500).json({ error: error.message });
   res.json(polls);
 });
 
 // Yangi poll qo'shish (faqat admin/superadmin)
-app.post('/api/polls', (req, res) => {
+app.post('/api/polls', async (req, res) => {
   const { question, options, role } = req.body;
   if (!question || !Array.isArray(options) || options.length < 2) {
     return res.status(400).json({ error: 'Savol va kamida 2 ta variant majburiy' });
@@ -301,75 +281,79 @@ app.post('/api/polls', (req, res) => {
   if (role !== 'admin' && role !== 'superadmin') {
     return res.status(403).json({ error: "Faqat admin yoki superadmin so'rovnoma qo'sha oladi" });
   }
-  const polls = readData('polls.json');
   const votes = {};
   options.forEach(opt => { votes[opt] = 0; });
   const newPoll = {
     id: uuidv4(),
     question,
+    options,
     votes,
     createdAt: new Date().toISOString()
   };
-  polls.unshift(newPoll);
-  writeData('polls.json', polls);
+  const { error } = await supabase.from('polls').insert([newPoll]);
+  if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(newPoll);
 });
 
-app.post('/api/polls/vote', (req, res) => {
+app.post('/api/polls/vote', async (req, res) => {
   const { pollId, option } = req.body;
-  let polls = readData('polls.json');
-  const poll = polls.find(p => p.id === pollId);
-  if (!poll) return res.status(404).json({ error: 'Poll topilmadi' });
+  const { data: polls, error: fetchError } = await supabase.from('polls').select('*').eq('id', pollId);
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (!polls || polls.length === 0) return res.status(404).json({ error: 'Poll topilmadi' });
+  const poll = polls[0];
   poll.votes[option] = (poll.votes[option] || 0) + 1;
-  writeData('polls.json', polls);
+  const { error } = await supabase.from('polls').update({ votes: poll.votes }).eq('id', pollId);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
-app.delete('/api/polls/:id', (req, res) => {
+app.delete('/api/polls/:id', async (req, res) => {
   const { id } = req.params;
   const { role, superadminToken } = req.query;
   if (role !== 'admin' && role !== 'superadmin' && superadminToken !== SUPERADMIN.password) {
     return res.status(403).json({ error: "Faqat admin yoki superadmin so'rovnomani o'chira oladi" });
   }
-  let polls = readData('polls.json');
-  polls = polls.filter(p => p.id !== id);
-  writeData('polls.json', polls);
+  const { error } = await supabase.from('polls').delete().eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
 // --- User profile (oddiy demo) ---
-app.get('/api/user/:id', (req, res) => {
-  const users = readData('users.json');
-  const user = users.find(u => u.id === req.params.id);
-  if (!user) return res.status(404).json({ error: 'User topilmadi' });
-  res.json(user);
+app.get('/api/user/:id', async (req, res) => {
+  const { id } = req.params;
+  const { data: users, error } = await supabase.from('users').select('*').eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
+  if (!users || users.length === 0) return res.status(404).json({ error: 'User topilmadi' });
+  res.json(users[0]);
 });
 
-// --- Category endpoints (faqat superadmin kategoriya qo'sha oladi) ---
-app.get('/api/categories', (req, res) => {
-  const categories = readData('categories.json');
+// --- Category endpoints (Supabase, faqat superadmin kategoriya qo'sha oladi) ---
+app.get('/api/categories', async (req, res) => {
+  const { data: categories, error } = await supabase.from('categories').select('*');
+  if (error) return res.status(500).json({ error: error.message });
   res.json(categories);
 });
 
-app.post('/api/categories', (req, res) => {
+app.post('/api/categories', async (req, res) => {
   const { name, superadminToken } = req.body;
   if (!name) return res.status(400).json({ error: 'Kategoriya nomi majburiy' });
   if (superadminToken !== SUPERADMIN.password) return res.status(403).json({ error: 'Faqat superadmin kategoriya qo\'sha oladi' });
-  const categories = readData('categories.json');
-  if (categories.find(cat => cat.name === name)) return res.status(400).json({ error: 'Bu nomli kategoriya allaqachon mavjud' });
+  // Check if category exists
+  const { data: categories, error: fetchError } = await supabase.from('categories').select('*').eq('name', name);
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (categories.length > 0) return res.status(400).json({ error: 'Bu nomli kategoriya allaqachon mavjud' });
   const newCategory = { id: uuidv4(), name };
-  categories.push(newCategory);
-  writeData('categories.json', categories);
+  const { error } = await supabase.from('categories').insert([newCategory]);
+  if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(newCategory);
 });
 
-app.delete('/api/categories/:id', (req, res) => {
+app.delete('/api/categories/:id', async (req, res) => {
   const { id } = req.params;
   const { superadminToken } = req.query;
   if (superadminToken !== SUPERADMIN.password) return res.status(403).json({ error: 'Faqat superadmin kategoriya o\'chira oladi' });
-  let categories = readData('categories.json');
-  categories = categories.filter(cat => cat.id !== id);
-  writeData('categories.json', categories);
+  const { error } = await supabase.from('categories').delete().eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
@@ -412,17 +396,16 @@ const teamLogos = {
   // ... boshqa mashhur klublar qo'shish mumkin ...
 };
 
-app.get('/api/featured-match', (req, res) => {
-  const matches = readData('matches.json');
+app.get('/api/featured-match', async (req, res) => {
+  const { data: matches, error } = await supabase.from('matches').select('*');
+  if (error) return res.status(500).json({ error: error.message });
   res.json(matches);
 });
 
-app.post('/api/featured-match', (req, res) => {
+app.post('/api/featured-match', async (req, res) => {
   const { home, away, time, date, league } = req.body;
   if (!home || !away || !time || !date || !league) return res.status(400).json({ error: 'Barcha maydonlar majburiy' });
   if (home === away) return res.status(400).json({ error: 'Uy va mehmon jamoalari bir xil bo\'lishi mumkin emas' });
-  
-  const matches = readData('matches.json');
   const newMatch = {
     id: uuidv4(),
     home: { name: home, logo: teamLogos[home] || null },
@@ -432,50 +415,41 @@ app.post('/api/featured-match', (req, res) => {
     league,
     createdAt: new Date().toISOString()
   };
-  matches.push(newMatch);
-  writeData('matches.json', matches);
+  const { error } = await supabase.from('matches').insert([newMatch]);
+  if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(newMatch);
 });
 
-app.put('/api/featured-match/:id', (req, res) => {
+app.put('/api/featured-match/:id', async (req, res) => {
   const { id } = req.params;
   const { home, away, time, date, league } = req.body;
   if (!home || !away || !time || !date || !league) return res.status(400).json({ error: 'Barcha maydonlar majburiy' });
   if (home === away) return res.status(400).json({ error: 'Uy va mehmon jamoalari bir xil bo\'lishi mumkin emas' });
-  
-  let matches = readData('matches.json');
-  const matchExists = matches.find(m => m.id === id);
-  if (!matchExists) return res.status(404).json({ error: 'Match topilmadi' });
-  
-  matches = matches.map(m => m.id === id ? {
-    ...m,
+  const { data: matches, error: fetchError } = await supabase.from('matches').select('*').eq('id', id);
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (!matches || matches.length === 0) return res.status(404).json({ error: 'Match topilmadi' });
+  const updatedMatch = {
     home: { name: home, logo: teamLogos[home] || null },
     away: { name: away, logo: teamLogos[away] || null },
     time,
     date,
     league,
     updatedAt: new Date().toISOString()
-  } : m);
-  writeData('matches.json', matches);
+  };
+  const { error } = await supabase.from('matches').update(updatedMatch).eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
-app.delete('/api/featured-match/:id', (req, res) => {
+app.delete('/api/featured-match/:id', async (req, res) => {
   const { id } = req.params;
-  let matches = readData('matches.json');
-  const matchExists = matches.find(m => m.id === id);
-  if (!matchExists) return res.status(404).json({ error: 'Match topilmadi' });
-  
-  matches = matches.filter(m => m.id !== id);
-  writeData('matches.json', matches);
+  const { data: matches, error: fetchError } = await supabase.from('matches').select('*').eq('id', id);
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (!matches || matches.length === 0) return res.status(404).json({ error: 'Match topilmadi' });
+  const { error } = await supabase.from('matches').delete().eq('id', id);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
-
-mongoose.connect('mongodb://localhost:27017/shu-klinika', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-}).then(() => console.log('MongoDB connected!'))
-  .catch(err => console.error('MongoDB connection error:', err));
 
 app.listen(PORT, () => {
   console.log(`eScore backend running on http://localhost:${PORT}`);
