@@ -477,6 +477,18 @@ app.delete('/api/featured-match/:id', async (req, res) => {
   res.json({ success: true });
 });
 
+// Foydalanuvchilar ro'yxati
+app.get('/api/users', (req, res) => {
+  const users = readJson('users.json');
+  res.json(users);
+});
+// Faqat admin va superadminlarni olish
+app.get('/api/admins', (req, res) => {
+  const users = readJson('users.json');
+  const admins = users.filter(u => u.role === 'admin' || u.role === 'superadmin');
+  res.json(admins);
+});
+
 app.listen(PORT, () => {
   console.log(`eScore backend running on http://localhost:${PORT}`);
 }); 
